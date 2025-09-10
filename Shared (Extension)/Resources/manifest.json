@@ -1,0 +1,35 @@
+{
+    "manifest_version": 3,
+    "default_locale": "en",
+
+    "name": "SummarizeIt",
+    "description": "Safari Browser extension to summarize text of the current URL, using local on-device LLM.",
+    "version": "1.0",
+
+    "icons": {
+        "48": "images/icon-48.png",
+        "96": "images/icon-96.png",
+        "128": "images/icon-128.png",
+        "256": "images/icon-256.png",
+        "512": "images/icon-512.png"
+    },
+
+    "background": {
+        "scripts": [ "background.js" ],
+        "type": "module"
+    },
+
+    "content_scripts": [{
+        "matches": [ "<all_urls>" ],
+        "js": [ "content.js", "Readability.js" ],
+        "run_at": [ "document_start", "document_idle"]
+    }],
+
+    "action": {
+        "default_popup": "popup.html",
+        "default_icon": "images/toolbar-icon.png"
+    },
+
+    "permissions": [ "nativeMessaging", "scripting", "tabs" , "activeTab" , "<all_urls>"],
+    "host_permissions" : [ "<all_urls>" ]
+}
