@@ -21,7 +21,7 @@
     "content_scripts": [{
         "matches": [ "<all_urls>" ],
         "js": [ "content.js", "Readability.js" ],
-        "run_at": [ "document_start", "document_idle"]
+        "run_at": "document_idle"
     }],
 
     "action": {

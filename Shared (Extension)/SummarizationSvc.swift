@@ -8,6 +8,7 @@
 import Foundation
 import NaturalLanguage
 import FoundationModels
+import os.log
 
 // MARK: - Output Types
 
@@ -23,39 +24,69 @@ struct SummaryAndSentiment: Equatable {
 }
 
 // MARK: - Summarizer
+// Optimized token estimator with language-aware ratios
 private func estimateTokens(_ s: String) -> Int {
-    max(1, Int(ceil(Double(s.count) / 3.6)))
+    // Check if text contains significant CJK characters (Chinese, Japanese, Korean)
+    let cjkCount = s.unicodeScalars.filter { scalar in
+        (0x4E00...0x9FFF).contains(scalar.value) ||  // CJK Unified Ideographs
+        (0x3400...0x4DBF).contains(scalar.value) ||  // CJK Extension A
+        (0x20000...0x2A6DF).contains(scalar.value)   // CJK Extension B
+    }.count
+    
+    let cjkRatio = Double(cjkCount) / Double(max(1, s.count))
+    
+    // CJK characters use ~1.5-2 chars per token, Latin uses ~4 chars per token
+    let charsPerToken: Double
+    if cjkRatio > 0.3 {
+        // Mostly CJK text
+        charsPerToken = 1.8
+    } else if cjkRatio > 0.1 {
+        // Mixed text
+        charsPerToken = 2.5
+    } else {
+        // Mostly Latin text
+        charsPerToken = 4.0
+    }
+    
+    return max(1, Int(ceil(Double(s.count) / charsPerToken)))
 }
 final class HierarchicalSummarizer {
     
     // Tune these for your model / prompts
     private let maxContextTokens: Int = 4096           // model limit
     
-    // === Updated defaults (safer) ===
-    private let responseTokensBudgetFinal: Int = 500   // keep 500 for final passes
-    private let responseTokensBudgetChunk: Int = 300   // lower budget for chunk passes
+    // === Optimized defaults for better performance ===
+    private let responseTokensBudgetFinal: Int = 400   // reduced for faster generation
+    private let responseTokensBudgetChunk: Int = 250   // lower budget for chunk passes
     
-    private let promptOverheadTokens: Int = 900        // safer buffer for instructions + formatting
-    private let defaultTargetChunkTokens: Int = 850    // ~0.8–0.9k target per chunk
-    private let defaultOverlapTokens: Int = 150        // ~150 token overlap
+    private let promptOverheadTokens: Int = 1100       // safe buffer for prompts
+    private let defaultTargetChunkTokens: Int = 700    // balanced for news articles
+    private let defaultOverlapTokens: Int = 40         // minimal overlap for context
     
-    // Timeouts (seconds)
-    private let chunkTimeout: TimeInterval = 60        // allow slower cold starts
-    private let finalTimeout: TimeInterval = 90
+    // Timeouts (seconds) - increased for reliability
+    private let chunkTimeout: TimeInterval = 90        // allow slower cold starts
+    private let finalTimeout: TimeInterval = 120       // more time for final synthesis
     
     // Session + options (reuse your session)
     private let session: LanguageModelSession
     private var options: GenerationOptions
     
     init() {
-        self.session = LanguageModelSession(instructions: {
-            "You are a concise, faithful summarizer. Preserve key facts; avoid speculation."
-        })
+        // Initialize session with NO instructions to avoid triggering safety filters
+        // Safari's built-in summarization likely uses minimal/no system instructions
+        self.session = LanguageModelSession()
         self.options = GenerationOptions(
             sampling: .greedy,
             temperature: 0.0,
-            maximumResponseTokens: 500
+            maximumResponseTokens: 400
         )
+    }
+    
+    // Test if the session is actually usable
+    func testAvailability() async throws {
+        _ = try await session.respond(generating: String.self, options: options) {
+            "test"
+        }.content
     }
     
     /// Conservative token estimator.
@@ -100,10 +131,13 @@ final class HierarchicalSummarizer {
             return SummaryAndSentiment(summaryText: "No readable content.", sentiment: "NA")
         }
         
+        // Validate language is not empty
+        let safeLang = language.isEmpty ? "English" : language
+        
         // If short enough, do your existing single-shot path
         if estimateTokens(safeText) + promptOverheadTokens + responseTokensBudgetFinal <= maxContextTokens {
             return try await withTimeout(finalTimeout) {
-                try await self.singleShotSummaryAndSentiment(inputText: safeText, language: language)
+                try await self.singleShotSummaryAndSentiment(inputText: safeText, language: safeLang)
             }
         }
         
@@ -121,44 +155,99 @@ final class HierarchicalSummarizer {
             chunks = forceSplitByChars(safeText, approxTokensPerChunk: defaultTargetChunkTokens)
         }
         
+        // Safety: limit maximum number of chunks to prevent runaway processing
+        let maxChunks = 12  // Balanced for news article coverage
+        if chunks.count > maxChunks {
+            os_log(.info, "Too many chunks (%d), truncating to %d", chunks.count, maxChunks)
+            chunks = Array(chunks.prefix(maxChunks))
+        }
+        
         // 2) Summarize each chunk (sequential for stability; adaptive shrinking + timeout)
         var chunkSummaries: [String] = []
         chunkSummaries.reserveCapacity(chunks.count)
         
-        for (idx, chunk) in chunks.enumerated() {
+        os_log(.info, "Processing %d chunks for language: %@", chunks.count, safeLang)
+        
+        // Test first chunk to detect safety filter issues early
+        do {
+            os_log(.info, "Testing first chunk for safety filters...")
+            let testChunk = chunks[0]
+            let testResult = try await summarizeChunkAdaptive(
+                testChunk,
+                language: safeLang,
+                ordinal: 1,
+                total: chunks.count
+            )
+            chunkSummaries.append(testResult)
+            os_log(.info, "First chunk successful, continuing with remaining chunks")
+        } catch {
+            // If first chunk fails, it's likely a safety filter issue
+            let errorStr = String(describing: error)
+            if errorStr.contains("safety") || errorStr.contains("deny") || errorStr.contains("blocked") {
+                os_log(.error, "Safety filter detected on first chunk - content blocked")
+                // Create a custom error that will be caught by the handler
+                struct SafetyFilterError: LocalizedError {
+                    var errorDescription: String? { "Content blocked by safety filters" }
+                }
+                throw SafetyFilterError()
+            }
+            throw error
+        }
+        
+        // Process remaining chunks
+        for idx in 1..<chunks.count {
+            let chunk = chunks[idx]
+            os_log(.info, "Processing chunk %d/%d (%d chars)", idx + 1, chunks.count, chunk.count)
             let s = try await summarizeChunkAdaptive(
                 chunk,
-                language: language,
+                language: safeLang,
                 ordinal: idx + 1,
                 total: chunks.count
             )
             chunkSummaries.append(s)
+            os_log(.info, "Completed chunk %d/%d", idx + 1, chunks.count)
         }
         
-        // 3) Summarize the summaries
-        let stitched = chunkSummaries.joined(separator: "\n\n")
+        // 3) If we have many chunks, do hierarchical reduction
+        var stitched = chunkSummaries.joined(separator: "\n\n")
+        
+        // If stitched summaries are still too large, summarize them in groups first
+        if estimateTokens(stitched) > defaultTargetChunkTokens * 2 {
+            var groupSummaries: [String] = []
+            let groupSize = 3 // summarize 3 chunks at a time
+            for i in stride(from: 0, to: chunkSummaries.count, by: groupSize) {
+                let end = min(i + groupSize, chunkSummaries.count)
+                let group = chunkSummaries[i..<end].joined(separator: "\n\n")
+                let groupSummary = try await withTimeout(finalTimeout) {
+                    try await self.summarizeStitchedSummaries(group, language: safeLang)
+                }
+                groupSummaries.append(groupSummary)
+            }
+            stitched = groupSummaries.joined(separator: "\n\n")
+        }
+        
+        // 4) Analyze sentiment from ORIGINAL first 1-2 chunks (before summarization neutralizes it)
+        // Use more text for better context, but not too much to avoid timeout
+        let sentimentChunks = chunks.prefix(min(2, chunks.count))
+        let sentimentText = sentimentChunks.joined(separator: "\n\n")
+        let sentiment = try await withTimeout(finalTimeout) {
+            try await self.detectSentiment(from: sentimentText, language: safeLang)
+        }
+        
+        // 5) Final summary (without sentiment, just text)
         let finalSummary = try await withTimeout(finalTimeout) {
-            try await self.summarizeStitchedSummaries(stitched, language: language)
+            try await self.summarizeStitchedSummaries(stitched, language: safeLang)
         }
         
-        // 4) Sentiment from final summary
-        let final = try await withTimeout(finalTimeout) {
-            try await self.summaryAndSentiment(from: finalSummary, language: language)
-        }
-        return final
+        return SummaryAndSentiment(summaryText: finalSummary, sentiment: sentiment)
     }
     
     // MARK: - Single-shot path (for small inputs)
     
     private func singleShotSummaryAndSentiment(inputText: String, language: String) async throws -> SummaryAndSentiment {
         let prefix = """
-        Summarize and analyze the following text in \(language) language.
+        Summarize the following text in \(language) and classify its sentiment as Positive, Neutral, or Negative:
         
-        Rules:
-        - Generate a concise summary (3–6 sentences) in \(language).
-        - Then classify the overall sentiment as exactly one of: Positive, Neutral, Negative.
-        
-        Text:
         """
         let suffix = "" // nothing after
         let (fitText, maxResp) = fitPromptAndResponse(
@@ -199,9 +288,9 @@ final class HierarchicalSummarizer {
     private func summarizeChunkAdaptive(_ text: String, language: String, ordinal: Int, total: Int) async throws -> String {
         var current = text
         var attempts = 0
-        var targetTokens = defaultTargetChunkTokens
+        var targetTokens = estimateTokens(text)
         
-        while attempts < 3 {
+        while attempts < 4 {
             do {
                 return try await withTimeout(chunkTimeout) {
                     try await self.summarizeChunk(
@@ -212,16 +301,49 @@ final class HierarchicalSummarizer {
                         maxResponseTokens: self.responseTokensBudgetChunk
                     )
                 }
+            } catch let error as LanguageModelSession.GenerationError {
+                // Check error type
+                let errorStr = String(describing: error)
+                let isSafetyError = errorStr.contains("safety") || errorStr.contains("deny") || errorStr.contains("blocked")
+                
+                // Safety errors cannot be retried - propagate immediately
+                if isSafetyError {
+                    os_log(.error, "Safety filter blocked content in chunk %d/%d", ordinal, total)
+                    throw error
+                }
+                
+                // Context window errors - aggressively shrink
+                if errorStr.contains("context window") || errorStr.contains("token") {
+                    attempts += 1
+                    targetTokens = Int(Double(targetTokens) * 0.5) // shrink 50%
+                    current = shrinkByApproxTokens(current, toApproxTokenBudget: targetTokens)
+                } else {
+                    // Other errors, try smaller shrink
+                    attempts += 1
+                    targetTokens = Int(Double(targetTokens) * 0.7)
+                    current = shrinkByApproxTokens(current, toApproxTokenBudget: targetTokens)
+                }
             } catch {
-                // Any generation/timeout error → shrink and retry
+                // Check if this is a safety error in generic catch
+                let errorStr = String(describing: error)
+                let isSafetyError = errorStr.contains("safety") || errorStr.contains("deny") || errorStr.contains("blocked")
+                
+                if isSafetyError {
+                    os_log(.error, "Safety filter blocked content in chunk %d/%d", ordinal, total)
+                    throw error
+                }
+                
+                // Timeout or other error - retry with smaller chunk
                 attempts += 1
-                targetTokens = Int(Double(targetTokens) * 0.7) // shrink ~30%
+                targetTokens = Int(Double(targetTokens) * 0.7)
                 current = shrinkByApproxTokens(current, toApproxTokenBudget: targetTokens)
             }
         }
         
-        // Last resort: return a trimmed piece so pipeline keeps going
-        return String(current.prefix(2000))
+        // Last resort: return a very short summary so pipeline keeps going
+        let charsPerToken = getCharsPerToken(for: current)
+        let maxChars = Int(200.0 * charsPerToken) // ~200 tokens worth
+        return String(current.prefix(maxChars))
     }
     
     /// Original chunk summarizer (unchanged prompt). Allows passing a per-call max tokens.
@@ -234,15 +356,8 @@ final class HierarchicalSummarizer {
     ) async throws -> String {
         
         let prefix = """
-        You will summarize chunk \(ordinal) of \(total) in \(language) language.
+        Summarize the following text in \(language):
         
-        Rules:
-        - Be concise (3–6 sentences).
-        - Preserve facts, entities, numbers, and cause-effect.
-        - Do not mention this is chunk \(ordinal)/\(total).
-        - No speculation, no hallucinations.
-        
-        Chunk:
         """
         let suffix = ""
         
@@ -263,19 +378,59 @@ final class HierarchicalSummarizer {
         return result.summaryText
     }
     
+    // MARK: - Sentiment detection from original text
+    
+    private func detectSentiment(from text: String, language: String) async throws -> String {
+        let prefix = """
+        Analyze the overall sentiment of this text based on the main events and their impact.
+        
+        Guidelines:
+        - Positive: Peace agreements, breakthroughs, resolutions, improvements, good outcomes, humanitarian aid success
+        - Negative: Active violence, attacks, casualties, disasters, crises, deteriorating situations, threats
+        - Neutral: Analysis, commentary, political appointments, routine updates, mixed developments
+        
+        For mixed content, prioritize the most significant or immediate event.
+        
+        Respond with only: Positive, Negative, or Neutral
+        
+        Text:
+        """
+        let suffix = ""
+        
+        let (fitText, maxResp) = fitPromptAndResponse(
+            promptPrefix: prefix + "\n",
+            variableText: text,
+            promptSuffix: suffix,
+            preferredResponseTokens: 150  // Need more tokens for reasoning
+        )
+        
+        let prompt = prefix + "\n" + fitText + suffix
+        
+        // Use simple string response for just sentiment
+        let result = try await session.respond(
+            generating: String.self,
+            options: optionsWith(maxTokens: maxResp)
+        ) { prompt }.content
+        
+        // Extract sentiment from response (should be "Positive", "Neutral", or "Negative")
+        let cleaned = result.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        
+        // Check for explicit classification first
+        if cleaned.contains("positive") && !cleaned.contains("not positive") && !cleaned.contains("no positive") {
+            return "Positive"
+        } else if cleaned.contains("negative") && !cleaned.contains("not negative") && !cleaned.contains("no negative") {
+            return "Negative"
+        } else {
+            return "Neutral"
+        }
+    }
+    
     // MARK: - Final summary from stitched chunk summaries
     
     private func summarizeStitchedSummaries(_ summariesText: String, language: String) async throws -> String {
         let prefix = """
-        You are given multiple chunk summaries of a larger document. Produce a single cohesive final summary in \(language) language.
+        Combine these summaries into one summary in \(language):
         
-        Rules:
-        - Synthesize across chunks; avoid repetition.
-        - Keep it concise (6–10 sentences).
-        - Maintain fidelity to the given content only.
-        - Include key facts, numbers, decisions, and outcomes.
-        
-        Chunk Summaries:
         """
         let suffix = ""
         
@@ -300,11 +455,8 @@ final class HierarchicalSummarizer {
     
     private func summaryAndSentiment(from finalSummary: String, language: String) async throws -> SummaryAndSentiment {
         let prefix = """
-        Given the final summary (already in \(language)), return:
-        - summaryText: a polished concise version (4–7 sentences) in \(language).
-        - sentiment: exactly one of Positive, Neutral, Negative based on the overall tone and outcomes.
+        Refine this summary in \(language) and classify sentiment as Positive, Neutral, or Negative:
         
-        Final Summary:
         """
         let suffix = ""
         
@@ -333,9 +485,25 @@ final class HierarchicalSummarizer {
     
     // MARK: - Chunking
     
-    /// Token estimator: safer (≈ 1 token per ~3.6 chars across EU languages).
-    private func estimateTokens(_ s: String) -> Int {
-        max(1, Int(ceil(Double(s.count) / 3.6)))
+    // Note: estimateTokens is defined at the top of the class
+    
+    // Helper to get chars-per-token ratio for a text
+    private func getCharsPerToken(for text: String) -> Double {
+        let cjkCount = text.unicodeScalars.filter { scalar in
+            (0x4E00...0x9FFF).contains(scalar.value) ||
+            (0x3400...0x4DBF).contains(scalar.value) ||
+            (0x20000...0x2A6DF).contains(scalar.value)
+        }.count
+        
+        let cjkRatio = Double(cjkCount) / Double(max(1, text.count))
+        
+        if cjkRatio > 0.3 {
+            return 1.8  // Mostly CJK
+        } else if cjkRatio > 0.1 {
+            return 2.5  // Mixed
+        } else {
+            return 4.0  // Mostly Latin
+        }
     }
     
     /// Sentence-aware splitting with overlap. Respects a hard max per block (input text tokens only).
@@ -417,7 +585,8 @@ final class HierarchicalSummarizer {
     
     // Force split by character windows (tries to cut on sentence boundary)
     private func forceSplitByChars(_ text: String, approxTokensPerChunk: Int) -> [String] {
-        let approxCharsPerToken = 3.6
+        // Use conservative estimate for CJK text
+        let approxCharsPerToken = getCharsPerToken(for: text)
         let maxChars = max(800, Int(Double(approxTokensPerChunk) * approxCharsPerToken))
         var out: [String] = []
         var start = text.startIndex
@@ -461,7 +630,7 @@ final class HierarchicalSummarizer {
     // If a single sentence is too large, split by character windows respecting hard max
     private func hardSplitLongSentence(_ sentence: String, hardMaxTokens: Int) -> [String] {
         let maxTokens = max(256, hardMaxTokens - 50)
-        let approxCharsPerToken = 3.6
+        let approxCharsPerToken = getCharsPerToken(for: sentence)
         let maxChars = Int(Double(maxTokens) * approxCharsPerToken)
         
         guard sentence.count > maxChars else { return [sentence] }
@@ -495,7 +664,7 @@ final class HierarchicalSummarizer {
     
     // Shrink a text by approximate token budget; prefers cutting at sentence boundary.
     private func shrinkByApproxTokens(_ s: String, toApproxTokenBudget budget: Int) -> String {
-        let approxCharsPerToken = 3.6
+        let approxCharsPerToken = getCharsPerToken(for: s)
         let maxChars = max(800, Int(Double(budget) * approxCharsPerToken))
         guard s.count > maxChars else { return s }
         

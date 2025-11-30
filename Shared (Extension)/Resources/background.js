@@ -1,6 +1,6 @@
 // background.js — overlay-only mode
 const NATIVE_HOST = "com.summarizeit.SummarizeIt.Extension";
-const NATIVE_TIMEOUT_MS = 60000;
+const NATIVE_TIMEOUT_MS = 240000; // 4 minutes for very large documents
 const SF_KEY = "com.apple.Safari.web-extension-message";
 
 function unwrapNativeResponse(nativeResponse) {

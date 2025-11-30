@@ -12,15 +12,19 @@ import UIKit
 #endif
 enum AIAvailability {
 
-    // --- Turn on only for local simulator testing
+    // --- WARNING: Simulator device checks pass, but Foundation Models APIs are NOT available
+    // --- This flag only allows the extension to load in simulator for UI testing
+    // --- Actual summarization will fail with "unavailable" error
     static let allowInSimulatorForDev = true
 
-    /// Main gate
+    /// Main gate - checks if device SHOULD support Apple Intelligence
+    /// Note: In simulator, this returns true but actual APIs will fail
     static func isAppleIntelligenceAvailable() -> Bool {
         guard #available(iOS 26, macOS 26, *) else { return false }
 
         #if targetEnvironment(simulator)
         if !allowInSimulatorForDev { return false }
+        // Device check passes, but actual Foundation Models are NOT available in simulator
         #endif
 
         #if os(iOS)
