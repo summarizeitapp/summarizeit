@@ -16,58 +16,99 @@
         let articleText = "";
         let articleTitle = "";
         
-        // Helper function to extract title from DOM
-        function extractTitleFromDOM() {
-            // Try to find the main article title in the visible viewport
+        // Helper function to check if element is in viewport
+        function isInViewport(element) {
+            const rect = element.getBoundingClientRect();
+            const windowHeight = window.innerHeight || document.documentElement.clientHeight;
+            const windowWidth = window.innerWidth || document.documentElement.clientWidth;
+            
+            // Element is in viewport if at least 30% is visible
+            const vertInView = (rect.top <= windowHeight * 0.7) && ((rect.top + rect.height) >= windowHeight * 0.3);
+            const horInView = (rect.left <= windowWidth) && ((rect.left + rect.width) >= 0);
+            
+            return vertInView && horInView;
+        }
+        
+        // Helper function to find article container in viewport
+        function findArticleInViewport() {
+            const articleSelectors = [
+                'article[role="article"]',
+                'article.article',
+                'article',
+                '[role="article"]',
+                '.article-container',
+                '.post',
+                '.entry'
+            ];
+            
+            for (const selector of articleSelectors) {
+                const articles = document.querySelectorAll(selector);
+                for (const article of articles) {
+                    if (isInViewport(article)) {
+                        return article;
+                    }
+                }
+            }
+            
+            return null;
+        }
+        
+        // Helper function to extract title from container
+        function extractTitleFromContainer(container) {
             const titleSelectors = [
-                'article h1[class*="title"]',
-                'article h1[class*="headline"]',
-                'main h1[class*="title"]',
-                'main h1[class*="headline"]',
-                '[role="main"] h1',
-                'article h1',
-                'main h1',
-                'h1[class*="article"]',
-                'h1[class*="post"]',
-                'h1[class*="entry"]',
-                '.article-title',
-                '.post-title',
-                '.entry-title',
-                'h1'
+                'h1[class*="title"]',
+                'h1[class*="headline"]',
+                'h1',
+                'h2[class*="title"]',
+                'h2[class*="headline"]',
+                '[class*="article-title"]',
+                '[class*="post-title"]'
             ];
             
             for (const selector of titleSelectors) {
-                const titleEl = document.querySelector(selector);
+                const titleEl = container.querySelector(selector);
                 if (titleEl && titleEl.innerText && titleEl.innerText.trim().length > 10) {
                     return titleEl.innerText.trim();
                 }
             }
             
-            return document.title || "";
+            return null;
         }
         
-        try {
-            if (typeof Readability === "function") {
-                const parsed = new Readability(document.cloneNode(true)).parse();
-                if (parsed?.textContent) {
-                    articleText = parsed.textContent;
-                    // Try DOM extraction first, fallback to Readability title
-                    articleTitle = extractTitleFromDOM();
-                    if (!articleTitle || articleTitle === document.title) {
-                        articleTitle = parsed.title || document.title || "";
+        // FIRST: Try to find article in viewport (for continuous scroll pages)
+        const viewportArticle = findArticleInViewport();
+        
+        if (viewportArticle) {
+            // Extract from viewport article
+            articleTitle = extractTitleFromContainer(viewportArticle);
+            articleText = Array.from(viewportArticle.querySelectorAll("p, h1, h2, h3, h4, li"))
+                .map((el) => (el && el.innerText ? el.innerText.trim() : ""))
+                .filter(Boolean)
+                .join("\n");
+            
+            console.log("Extracted article from viewport:", articleTitle);
+        }
+        
+        // FALLBACK: Use Readability if viewport detection didn't work
+        if (!articleText || articleText.trim().length < 30) {
+            try {
+                if (typeof Readability === "function") {
+                    const parsed = new Readability(document.cloneNode(true)).parse();
+                    if (parsed?.textContent) {
+                        articleText = parsed.textContent;
+                        if (!articleTitle) {
+                            articleTitle = parsed.title || document.title || "";
+                        }
                     }
                 }
+            } catch (_) {
+                // ignore readability errors
             }
-        } catch (_) {
-            // ignore readability errors
         }
         
-        // Fallback when Readability missing/short - use more specific selectors
+        // LAST RESORT: Manual extraction
         if (!articleText || articleText.trim().length < 30) {
-            // Try to find main article container first
             const mainSelectors = [
-                'article[role="article"]',
-                'article.article',
                 'main article',
                 '[role="main"] article',
                 'article',
@@ -84,11 +125,9 @@
                 if (mainContainer) break;
             }
             
-            // If found a main container, extract only from there
             if (mainContainer) {
-                // Extract title if not already set
                 if (!articleTitle) {
-                    articleTitle = extractTitleFromDOM();
+                    articleTitle = extractTitleFromContainer(mainContainer) || document.title;
                 }
                 
                 articleText = Array.from(mainContainer.querySelectorAll("p, h1, h2, h3, h4, li"))
@@ -96,19 +135,17 @@
                     .filter(Boolean)
                     .join("\n");
             } else {
-                // Last resort: get all paragraphs but filter out likely non-article content
+                // Very last resort: filtered paragraphs
                 articleText = Array.from(document.querySelectorAll("p"))
                     .filter((el) => {
-                        // Filter out paragraphs in sidebars, footers, headers, nav, ads
                         const parent = el.closest('aside, footer, header, nav, [class*="sidebar"], [class*="related"], [class*="recommend"], [id*="sidebar"], [id*="related"], [id*="recommend"], [class*="ad-"], [id*="ad-"]');
                         return !parent && el.innerText && el.innerText.trim().length > 20;
                     })
                     .map((el) => el.innerText.trim())
                     .join("\n");
                 
-                // Extract title if not already set
                 if (!articleTitle) {
-                    articleTitle = extractTitleFromDOM();
+                    articleTitle = document.title;
                 }
             }
         }
