@@ -85,8 +85,6 @@
                 .map((el) => (el && el.innerText ? el.innerText.trim() : ""))
                 .filter(Boolean)
                 .join("\n");
-            
-            console.log("Extracted article from viewport:", articleTitle);
         }
         
         // FALLBACK: Use Readability if viewport detection didn't work
@@ -291,15 +289,12 @@
             
             const startSpeaking = () => {
                 // SIMPLE APPROACH: Speak entire summary as ONE utterance with keepalive
-                console.log(`Speaking entire text: ${textToSpeak.length} characters`);
-                
                 // Start keepalive timer to prevent Safari from sleeping
                 if (globalSpeechState.keepaliveTimer) {
                     clearInterval(globalSpeechState.keepaliveTimer);
                 }
                 globalSpeechState.keepaliveTimer = setInterval(() => {
                     if (globalSpeechState.isSpeaking && window.speechSynthesis.paused) {
-                        console.log("Keepalive: Resuming paused speech");
                         window.speechSynthesis.resume();
                     }
                 }, 50); // Check every 50ms
@@ -344,12 +339,9 @@
                         clearInterval(globalSpeechState.keepaliveTimer);
                         globalSpeechState.keepaliveTimer = null;
                     }
-                    console.log("Speech completed");
                 };
                 
                 utterance.onerror = (e) => {
-                    console.error("Speech error:", e.error);
-                    
                     // Cleanup on any error
                     speakBtn.textContent = "🔊 Listen";
                     speakBtn.classList.remove("speaking");
@@ -366,7 +358,6 @@
                 
                 // Speak it
                 window.speechSynthesis.speak(utterance);
-                console.log("Started speaking");
             }; // end startSpeaking
             
             // Ensure voices are loaded before starting
@@ -525,8 +516,7 @@
         const { data, article_url, articleTitle } = msg;
         
         if (!data || (!data.summary && !data.error && data.aiAvailable !== false)) {
-            showError("Summarization failed (empty payload). Check console for native response.");
-//            console.log("[AI] updatePopup no summary; payload:", data);
+            showError("Summarization failed (empty payload).");
             return;
         }
         
